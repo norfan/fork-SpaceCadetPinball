@@ -53,6 +53,102 @@ Platforms covered by this project: desktop Windows, Linux and macOS.
 * All structures were populated, globals and locals named.
 * All subs were decompiled, C pseudo code was converted to compilable C++. Loose (namespace?) subs were assigned to classes.
 
+## Custom table skins
+
+The playfield art is baked into the `.DAT`, and the collision geometry was authored against it, so
+the shipped table is never modified on disk. Instead a skin replaces the pixels of the loaded
+playfield bitmap at runtime; the depth map, the sprites and every collision edge stay untouched.
+Selecting `Original` copies the backup back, so switching is lossless and repeatable.
+
+* Menu: `Options > Graphics > Table Theme`
+* Keyboard: `F7` cycles through `Original` and every listed skin
+* Command line: `-theme=<name>` (e.g. `-theme=neon-grid`) for testing
+
+Skins live in `bin/themes/`:
+
+```
+bin/themes/
+  themes.txt        one line per skin:  Display name|file.bmp|layout
+  neon-grid.bmp
+  violet-noir.bmp
+  amber-dusk.bmp
+  nebula.bmp        a whole second table, see below
+```
+
+Any BMP works. It is scaled to the playfield size on load (583x751 at the highest table
+resolution), so a 1x skin can be dropped in without resizing by hand. Files listed in `themes.txt`
+appear in the menu in that order; if the manifest is missing the three bundled skins are offered.
+
+`tools/make_themes.py` regenerates the bundled skins. It draws the base wash, light pools, grid,
+centre rings, launch lane and flipper funnel from scratch, then embosses the result with a
+directional gradient of the original artwork so the surface still reads as a real playfield with
+ramps and cut-outs:
+
+```
+python tools/make_themes.py            # writes bin/themes/*.bmp and themes-preview.png
+```
+
+![Nebula against the stock table](docs/nebula-vs-stock.png)
+
+## A second table: NEBULA
+
+A skin only repaints the playfield. `Nebula`, the last line of `themes.txt`, also declares a
+*layout* (the optional third field), and that turns the skin into a different table:
+
+* the outer bowl, the shooter lane and the slingshots are replaced with new walls, installed as
+  fresh collision edges and registered in the broad-phase grid;
+* the bumper cluster, the target banks, the rollovers, the scoops, the one-way gates and the
+  rebound posts are moved to new world coordinates, sprites included;
+* everything left on the playfield that the layout does not use is taken off the table — its
+  collision edges lose the ball's collision group and its sprite is flagged hidden, so the
+  original hardware neither shows nor deflects anything;
+* the flippers, the plunger, the drain and the rules are untouched, so the same game plays out on a
+  completely different playfield.
+
+Selecting `Original` restores the geometry from a snapshot taken the first time a layout was
+applied, which makes the switch lossless and repeatable. `F8` cycles the layout on its own, without
+changing the art, and `-debug` draws the collision overlay if you want to see where the walls
+actually ended up.
+
+`tools/nebula_layout.py` is the single source of truth for the second table: it defines the layout
+in the engine's world coordinates, renders the matching artwork through the same perspective
+projection the engine uses, and emits `SpaceCadetPinball/tablelayout_nebula.inc`, which the C++ side
+consumes at runtime:
+
+```
+python tools/nebula_layout.py              # writes bin/themes/nebula.bmp and the .inc
+python tools/nebula_layout.py --preview    # also writes nebula-preview.png
+```
+
+Known gaps: the insert lamps (`lite*`, `literoll*`) belong to the stock layout and are hidden rather
+than remounted, so NEBULA leans on the artwork and the HUD for feedback; the bumper and target
+sprites keep their original artwork; and the painted slingshots have no kicker behind them yet.
+
+## Presentation and ball effects
+
+The scoreboard column that is painted into the artwork is no longer shown. The window is sized
+around the playfield alone, and the score moves into a floating HUD drawn over the top of it,
+together with the ball counter, the player number and a `+score` marker that floats up and fades on
+every gain.
+
+* `Options > Graphics > Ball Motion Trail` — fading ghost trail behind the ball, on by default
+* `Options > Graphics > Effect Ball` — gives the ball an elemental identity
+* `Options > Graphics > UI Scale` — the atlas is rasterized at the scaled size instead of being
+  stretched, so large text stays sharp (applies on restart)
+
+Effect balls are palette-driven, so they drop straight into the existing 8-bit software renderer:
+the sphere is tinted towards the element colour, the trail fades out through the same hue, and a
+soft halo is composited around the ball. Eight kinds ship — `Classic`, `Fire`, `Ice`, `Electric`,
+`Plasma`, `Rainbow`, `Ghost` and `Gold` — and the floating score markers pick up the same accent
+colour, so scoring feedback matches the ball in play.
+
+```
+-ball=<0..7>        preselect an effect ball (0 = classic, matches the menu order)
+```
+
+Every capture in `docs/` was produced headless by `-screenshot=<path>` together with `-autoplay`,
+and checked pixel by pixel with the harnesses in `tools/`.
+
 ## Compiling
 
 Project uses `C++11` and depends on `SDL2` libs.

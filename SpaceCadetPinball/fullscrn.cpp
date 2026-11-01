@@ -5,6 +5,7 @@
 #include "options.h"
 #include "pb.h"
 #include "render.h"
+#include "TPinballTable.h"
 #include "winmain.h"
 
 
@@ -106,6 +107,15 @@ int fullscrn::GetMaxResolution()
 	return pb::FullTiltMode && !pb::FullTiltDemoMode ? 2 : 0;
 }
 
+int fullscrn::GetTableWidth()
+{
+	// The table layers report their own width once the DAT is loaded; fall back to
+	// the fixed ratio while that has not happened yet.
+	if (pb::MainTable && pb::MainTable->Width > 0)
+		return pb::MainTable->Width;
+	return static_cast<int>(lround(resolution_array[resolution].TableWidth * TableWidthRatio));
+}
+
 void fullscrn::window_size_changed()
 {
 	int width, height;
@@ -113,7 +123,12 @@ void fullscrn::window_size_changed()
 	int menuHeight = options::Options.ShowMenu ? winmain::MainMenuHeight : 0;
 	height -= menuHeight;
 	auto res = &resolution_array[resolution];
-	ScaleX = static_cast<float>(width) / res->TableWidth;
+
+	// The scoreboard column is never shown any more, so the playfield always
+	// owns the whole window.
+	auto visibleWidth = GetTableWidth();
+
+	ScaleX = static_cast<float>(width) / visibleWidth;
 	ScaleY = static_cast<float>(height) / res->TableHeight;
 	OffsetX = OffsetY = 0;
 	auto offset2X = 0, offset2Y = 0;
@@ -129,7 +144,7 @@ void fullscrn::window_size_changed()
 		ScaleY = ScaleX = std::min(ScaleX, ScaleY);
 	}
 
-	offset2X = static_cast<int>(floor(width - res->TableWidth * ScaleX));
+	offset2X = static_cast<int>(floor(width - visibleWidth * ScaleX));
 	offset2Y = static_cast<int>(floor(height - res->TableHeight * ScaleY));
 	OffsetX = offset2X / 2;
 	OffsetY = offset2Y / 2;

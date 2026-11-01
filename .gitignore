@@ -300,3 +300,14 @@ _deps
 build.ninja
 # Build directory
 /build
+/build-native
+
+# Scratch frames written by the visual-regression harness in tools/.
+# Anything worth keeping goes in docs/.
+/*.bmp
+/*.png
+/*.gif
+/hue_out.txt
+
+# Agent workspace state (memory, scratch)
+/.workbuddy/

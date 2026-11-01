@@ -44,6 +44,8 @@ endforeach()
 
 
 set(SOURCE_FILES
+        SpaceCadetPinball/balleffects.cpp
+        SpaceCadetPinball/balleffects.h
         SpaceCadetPinball/control.cpp
         SpaceCadetPinball/control.h
         SpaceCadetPinball/EmbeddedData.cpp
@@ -58,6 +60,8 @@ set(SOURCE_FILES
         SpaceCadetPinball/GroupData.h
         SpaceCadetPinball/high_score.cpp
         SpaceCadetPinball/high_score.h
+        SpaceCadetPinball/hud.cpp
+        SpaceCadetPinball/hud.h
         SpaceCadetPinball/loader.cpp
         SpaceCadetPinball/loader.h
         SpaceCadetPinball/maths.cpp
@@ -72,6 +76,11 @@ set(SOURCE_FILES
         SpaceCadetPinball/partman.h
         SpaceCadetPinball/pb.cpp
         SpaceCadetPinball/pb.h
+        SpaceCadetPinball/tablelayout.cpp
+        SpaceCadetPinball/tablelayout.h
+        SpaceCadetPinball/tablelayout_nebula.inc
+        SpaceCadetPinball/tabletheme.cpp
+        SpaceCadetPinball/tabletheme.h
         SpaceCadetPinball/pch.h
         SpaceCadetPinball/proj.cpp
         SpaceCadetPinball/proj.h

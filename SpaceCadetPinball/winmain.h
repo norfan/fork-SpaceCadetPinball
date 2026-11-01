@@ -74,6 +74,7 @@ public:
 	static bool LaunchBallEnabled;
 	static bool HighScoresEnabled;
 	static bool DemoActive;
+	static bool Autoplay;
 	static int MainMenuHeight;
 
 	static int WinMain(LPCSTR lpCmdLine);
@@ -109,6 +110,15 @@ private:
 	static int CursorIdleCounter;
 
 	static void RenderUi();
+
+	// -screenshot=<path> [-screenshot-frame=N] [-screenshot-count=K]
+	// [-screenshot-interval=M]: write frames to disk while playing. Reads the GPU
+	// target, so it also works with a locked desktop.
+	static std::string ScreenshotPath;
+	static int ScreenshotFrame;
+	static int ScreenshotCount;
+	static int ScreenshotInterval;
+	static void TakeScheduledScreenshots(int frame);
 	static void RenderFrameTimeDialog();
 	static void HybridSleep(DurationMs seconds);
 	static void MainLoop();

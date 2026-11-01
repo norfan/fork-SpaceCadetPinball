@@ -1,6 +1,10 @@
 #include "pch.h"
 #include "render.h"
 
+#include <algorithm>
+#include <cmath>
+
+#include "balleffects.h"
 #include "fullscrn.h"
 #include "GroupData.h"
 #include "options.h"
@@ -10,6 +14,213 @@
 #include "winmain.h"
 #include "DebugOverlay.h"
 #include "proj.h"
+
+namespace
+{
+	// Longest distance a ghost may trail behind the ball, in vScreen pixels.
+	constexpr int TrailMaxDistance = 120;
+
+	// Largest ball bitmap seen in any of the DAT files.
+	constexpr int MaxBallBitmapSize = 64;
+
+	// Extra halo radius budget reserved around the ball so an effect ball's
+	// glow fits inside the saved region (and is therefore restored correctly
+	// on the following frame) without enlarging the trail margin itself.
+	constexpr int MaxGlowRadius = 64;
+
+	// Backing store for the region a ball (plus its trail and its glow) covers
+	// on vScreen. Sized so the widest possible trail plus the largest halo fit.
+	constexpr int BallSaveBufferSize =
+		MaxBallBitmapSize + 2 * (TrailMaxDistance + MaxGlowRadius);
+
+	// Alpha of the newest ghost. Older ones fade linearly from here down to
+	// nearly zero, so the tail dissolves into the table instead of ending in a
+	// hard edge.
+	constexpr unsigned TrailMaxAlpha = 150;
+
+	// Distance in vScreen pixels between two consecutive ghosts, and the cap on
+	// how many of them one frame may insert (protects against teleports).
+	constexpr double TrailGhostSpacing = 5.0;
+	constexpr int TrailMaxSteps = 8;
+
+	// Alpha-blended counterpart of zdrv::paint_flat. paint_flat copies pixels
+	// verbatim; trail ghosts need to fade out towards the tail, otherwise they
+	// would look like a second solid ball. When `style` is non-null the ghost
+	// is tinted towards the element colour (and, for a rainbow ball, towards a
+	// hue that advances along the tail) so the streak reads as elemental.
+	void paint_ghost(int width, int height, int dstX, int dstY, int srcX, int srcY,
+	                 gdrv_bitmap8* dstBmp, zmap_header_type* zMap, int zX, int zY,
+	                 gdrv_bitmap8* srcBmp, uint16_t depth, unsigned alpha,
+	                 const balleffects::Style* style, float hueT)
+	{
+		auto dstPtr = &dstBmp->BmpBufPtr1[dstBmp->Stride * dstY + dstX];
+		auto srcPtr = &srcBmp->BmpBufPtr1[srcBmp->Stride * srcY + srcX];
+		auto zPtr = &zMap->ZPtr1[zMap->Stride * zY + zX];
+		const auto invAlpha = 255u - alpha;
+
+		uint8_t er = 200, eg = 220, eb = 240;  // element colour, used only when style != nullptr
+		float mix = 0.0f;
+		if (style)
+		{
+			if (style->Rainbow)
+				balleffects::RainbowColor(hueT, er, eg, eb);
+			else
+			{
+				er = style->R; eg = style->G; eb = style->B;
+			}
+			// Coloured balls tint strongly; the pale Ghost kind tints less.
+			mix = style->Rainbow ? 0.8f : 0.7f * style->Trail;
+		}
+
+		for (int y = height; y > 0; --y)
+		{
+			for (int x = width; x > 0; --x)
+			{
+				if (srcPtr->Color && *zPtr > depth)
+				{
+					auto dst = *dstPtr;
+					const auto src = *srcPtr;
+					// Tint the ghost pixel towards the element colour first
+					// (mix = 0 keeps the classic look), then alpha-blend onto the
+					// destination. A plain blend, not an accumulation, so
+					// overlapping ghosts stay as bright as the ball itself.
+					const uint8_t gR = static_cast<uint8_t>(src.GetRed()   * (1.0f - mix) + er * mix);
+					const uint8_t gG = static_cast<uint8_t>(src.GetGreen() * (1.0f - mix) + eg * mix);
+					const uint8_t gB = static_cast<uint8_t>(src.GetBlue()  * (1.0f - mix) + eb * mix);
+					dst.SetRed(static_cast<uint8_t>((gR * alpha + dst.GetRed() * invAlpha) / 255));
+					dst.SetGreen(static_cast<uint8_t>((gG * alpha + dst.GetGreen() * invAlpha) / 255));
+					dst.SetBlue(static_cast<uint8_t>((gB * alpha + dst.GetBlue() * invAlpha) / 255));
+					dst.SetAlpha(0xff);
+					*dstPtr = dst;
+				}
+				++srcPtr;
+				++dstPtr;
+				++zPtr;
+			}
+
+			srcPtr += srcBmp->Stride - width;
+			dstPtr += dstBmp->Stride - width;
+			zPtr += zMap->Stride - width;
+		}
+	}
+
+	// Solid ball painter. zdrv::paint_flat copies the sphere bitmap verbatim;
+	// for an effect ball the sphere itself is tinted towards the element colour
+	// so the ball and its trail read as one thing. The tint is a lerp towards
+	// the element colour, which keeps the bitmap's own shading and highlight.
+	void paint_ball(int width, int height, int dstX, int dstY, int srcX, int srcY,
+	                gdrv_bitmap8* dstBmp, zmap_header_type* zMap, int zX, int zY,
+	                gdrv_bitmap8* srcBmp, uint16_t depth,
+	                const balleffects::Style* style, float hueT)
+	{
+		auto dstPtr = &dstBmp->BmpBufPtr1[dstBmp->Stride * dstY + dstX];
+		auto srcPtr = &srcBmp->BmpBufPtr1[srcBmp->Stride * srcY + srcX];
+		auto zPtr = &zMap->ZPtr1[zMap->Stride * zY + zX];
+
+		uint8_t er = 200, eg = 220, eb = 240;
+		float mix = 0.0f;
+		if (style)
+		{
+			if (style->Rainbow)
+				balleffects::RainbowColor(hueT, er, eg, eb);
+			else
+			{
+				er = style->R; eg = style->G; eb = style->B;
+			}
+			mix = style->Rainbow ? 0.85f : 0.72f * style->Trail;
+		}
+
+		for (int y = height; y > 0; --y)
+		{
+			for (int x = width; x > 0; --x)
+			{
+				if (srcPtr->Color && *zPtr > depth)
+				{
+					const auto src = *srcPtr;
+					// Lerp towards the element colour, then keep the source
+					// luminance ratio so the sphere does not turn into a
+					// flat coloured disc.
+					const float lum = (src.GetRed() * 0.299f + src.GetGreen() * 0.587f + src.GetBlue() * 0.114f) / 255.0f;
+					auto dst = *srcPtr;
+					dst.SetRed(static_cast<uint8_t>(src.GetRed()   * (1.0f - mix) + er * mix * (0.35f + 0.65f * lum)));
+					dst.SetGreen(static_cast<uint8_t>(src.GetGreen() * (1.0f - mix) + eg * mix * (0.35f + 0.65f * lum)));
+					dst.SetBlue(static_cast<uint8_t>(src.GetBlue()  * (1.0f - mix) + eb * mix * (0.35f + 0.65f * lum)));
+					dst.SetAlpha(0xff);
+					*dstPtr = dst;
+				}
+				++srcPtr;
+				++dstPtr;
+				++zPtr;
+			}
+
+			srcPtr += srcBmp->Stride - width;
+			dstPtr += dstBmp->Stride - width;
+			zPtr += zMap->Stride - width;
+		}
+	}
+
+	// Additive glow drawn around an effect ball. The profile is deliberately
+	// two-zone: inside the ball's radius the element colour only tints the
+	// sphere (so its own shading and highlight stay readable), and outside it
+	// a halo peaks at the ball's edge and dies out at the outer radius. The
+	// z-map is only read, never written, so anything drawn in front of the
+	// ball occludes the glow for free. The caller must keep the affected
+	// rectangle inside the saved dirty region.
+	void paint_glow(int cx, int cy, int innerR, int outerR, uint8_t cr, uint8_t cg, uint8_t cb,
+	                float strength, gdrv_bitmap8* dstBmp, zmap_header_type* zMap,
+	                uint16_t depth, const rectangle_type& bounds)
+	{
+		if (outerR <= 0 || strength <= 0.0f)
+			return;
+
+		const int x0 = std::max(0, std::max(bounds.XPosition, cx - outerR));
+		const int y0 = std::max(0, std::max(bounds.YPosition, cy - outerR));
+		const int x1 = std::min(dstBmp->Width,  std::min(bounds.XPosition + bounds.Width,  cx + outerR + 1));
+		const int y1 = std::min(dstBmp->Height, std::min(bounds.YPosition + bounds.Height, cy + outerR + 1));
+		const float inner = static_cast<float>(std::max(1, innerR));
+		const float outer = static_cast<float>(outerR);
+		const float span = std::max(1.0f, outer - inner);
+
+		for (int y = y0; y < y1; ++y)
+		{
+			auto* dstPtr = &dstBmp->BmpBufPtr1[dstBmp->Stride * y + x0];
+			auto* zPtr   = &zMap->ZPtr1[zMap->Stride * y + x0];
+			const int dy = y - cy;
+			for (int x = x0; x < x1; ++x)
+			{
+				const int dx = x - cx;
+				const float dist = std::sqrt(static_cast<float>(dx * dx + dy * dy));
+				if (dist <= outer && *zPtr >= depth)
+				{
+					float intensity;
+					if (dist <= inner)
+					{
+						// Core: a gentle tint that keeps the sphere readable.
+						intensity = strength * 0.38f * (1.0f - 0.45f * (dist / inner));
+					}
+					else
+					{
+						// Halo: peaks at the ball's edge, fades to nothing.
+						const float t = (dist - inner) / span;
+						intensity = strength * (1.0f - t) * (1.0f - t);
+					}
+					auto dst = *dstPtr;
+					dst.SetRed(static_cast<uint8_t>(std::min(255.f, dst.GetRed()   + cr * intensity)));
+					dst.SetGreen(static_cast<uint8_t>(std::min(255.f, dst.GetGreen() + cg * intensity)));
+					dst.SetBlue(static_cast<uint8_t>(std::min(255.f, dst.GetBlue()  + cb * intensity)));
+					dst.SetAlpha(0xff);
+					*dstPtr = dst;
+				}
+				++dstPtr;
+				++zPtr;
+			}
+		}
+	}
+
+	// Animated phase driving the rainbow ball's hue cycle. Advanced once per
+	// paint_balls call so the colour keeps shifting while the ball is in play.
+	static float GlowPhase = 0.0f;
+}
 
 std::vector<render_sprite*> render::sprite_list, render::ball_list;
 zmap_header_type* render::background_zmap;
@@ -111,7 +322,7 @@ void render::init(gdrv_bitmap8* bmp, int width, int height)
 	vscreen->YPosition = 0;
 	vscreen->XPosition = 0;
 	for (auto& ballBmp : ball_bitmap)
-		ballBmp = new gdrv_bitmap8(64, 64, false);
+		ballBmp = new gdrv_bitmap8(BallSaveBufferSize, BallSaveBufferSize, false);
 
 	background_bitmap = bmp;
 	if (bmp)
@@ -152,6 +363,15 @@ void render::update()
 		if (!sprite->DirtyFlag)
 			continue;
 
+		// A hidden sprite is not drawn by anyone and has no occlude list, so
+		// clearing its old damage would leave a hole rather than restore it.
+		if (sprite->Hidden)
+		{
+			sprite->DirtyFlag = false;
+			sprite->DirtyRectPrev = rectangle_type{};
+			continue;
+		}
+
 		bool clearSprite = false;
 		switch (sprite->VisualType)
 		{
@@ -190,7 +410,7 @@ void render::update()
 	// Paint dirty rectangles of dirty sprites
 	for (auto sprite : sprite_list)
 	{
-		if (!sprite->DirtyFlag)
+		if (!sprite->DirtyFlag || sprite->Hidden)
 			continue;
 
 		repaint(*sprite);
@@ -232,7 +452,7 @@ void render::repaint(const render_sprite& sprite)
 
 	for (auto refSprite : *sprite.OccludedSprites)
 	{
-		if (!refSprite->DeleteFlag && refSprite->Bmp)
+		if (!refSprite->DeleteFlag && refSprite->Bmp && !refSprite->Hidden)
 		{
 			if (maths::rectangle_clip(refSprite->BmpRect, sprite.DirtyRect, &clipRect))
 				zdrv::paint(
@@ -263,35 +483,246 @@ void render::paint_balls()
 		return lhs->Depth < rhs->Depth;
 	});
 
+	const bool trailEnabled = options::Options.BallTrail.V;
+
+	// Effect-ball identity. Normal keeps the classic silver sphere + trail;
+	// every other kind adds a coloured (or rainbow) trail and a glow halo.
+	const auto ballKind = static_cast<balleffects::Kind>(options::Options.BallKind.V);
+	const auto& ballStyle = balleffects::Get(ballKind);
+	const bool effectBall = ballKind != balleffects::Kind::Normal;
+
+	// Drive the rainbow hue cycle while the ball is in play.
+	GlowPhase += 0.015f;
+
 	// For balls that clip vScreen: save original vScreen contents and paint ball bitmap.
 	for (auto index = 0u; index < ball_list.size(); ++index)
 	{
 		auto ball = ball_list[index];
 		auto dirty = &ball->DirtyRect;
-		if (ball->Bmp && maths::rectangle_clip(ball->BmpRect, vscreen_rect, &ball->DirtyRect))
+
+		if (!ball->Bmp)
 		{
-			int xPos = dirty->XPosition;
-			int yPos = dirty->YPosition;
+			dirty->Width = -1;
+			ball->TrailCount = 0;
+			continue;
+		}
+
+		const auto ballX = ball->BmpRect.XPosition;
+		const auto ballY = ball->BmpRect.YPosition;
+		const auto ballW = ball->BmpRect.Width;
+		const auto ballH = ball->BmpRect.Height;
+
+		// Reserve a halo margin around the ball so the glow lands inside the
+		// saved rectangle (and is therefore restored correctly next frame).
+		const int ballRadius = std::min(ballW, ballH) / 2;
+		const int glowR = effectBall
+			? std::min(MaxGlowRadius, static_cast<int>(ballRadius * (1.0f + 1.1f * ballStyle.Glow) + 6.0f))
+			: 0;
+
+		// The repaint rectangle has to cover the ghosts too, otherwise the trail
+		// is never restored from the background and smears across the table.
+		rectangle_type paintRect = ball->BmpRect;
+		for (int i = 0; i < ball->TrailCount; i++)
+		{
+			const auto dx = ball->TrailX[i] - ballX;
+			const auto dy = ball->TrailY[i] - ballY;
+			if (dx * dx + dy * dy > TrailMaxDistance * TrailMaxDistance)
+				continue;
+
+			const rectangle_type sample{ ball->TrailX[i], ball->TrailY[i], ballW, ballH };
+			maths::enclosing_box(paintRect, sample, paintRect);
+		}
+
+		// Include the glow halo in the repaint rectangle so the saved region
+		// covers it too (otherwise the halo would smear across the table).
+		if (glowR > 0)
+		{
+			const rectangle_type glowBox{ ballX - glowR, ballY - glowR,
+			                             ballW + 2 * glowR, ballH + 2 * glowR };
+			maths::enclosing_box(paintRect, glowBox, paintRect);
+		}
+
+		// Hard limit: the save buffer must always be large enough, whatever the
+		// table throws at us. The margin covers the longest trail plus the
+		// widest possible glow halo.
+		const rectangle_type saveLimit{
+			ballX - (TrailMaxDistance + glowR), ballY - (TrailMaxDistance + glowR),
+			ballW + 2 * (TrailMaxDistance + glowR), ballH + 2 * (TrailMaxDistance + glowR)
+		};
+		rectangle_type limited{};
+		if (maths::rectangle_clip(paintRect, saveLimit, &limited))
+			paintRect = limited;
+		else
+			paintRect = ball->BmpRect;
+
+		if (maths::rectangle_clip(paintRect, vscreen_rect, dirty))
+		{
+			const auto xPos = dirty->XPosition;
+			const auto yPos = dirty->YPosition;
 			gdrv::copy_bitmap(ball_bitmap[index], dirty->Width, dirty->Height, 0, 0, vscreen, xPos, yPos);
-			zdrv::paint_flat(
-				dirty->Width,
-				dirty->Height,
-				vscreen,
-				xPos,
-				yPos,
-				zscreen,
-				xPos,
-				yPos,
-				ball->Bmp,
-				xPos - ball->BmpRect.XPosition,
-				yPos - ball->BmpRect.YPosition,
-				ball->Depth);
+
+			// Oldest ghost first (faintest), the solid ball is drawn last on top.
+			for (int i = 0; i < ball->TrailCount; i++)
+			{
+				const auto dx = ball->TrailX[i] - ballX;
+				const auto dy = ball->TrailY[i] - ballY;
+				if (dx * dx + dy * dy > TrailMaxDistance * TrailMaxDistance)
+					continue;
+
+				const rectangle_type ghost{ ball->TrailX[i], ball->TrailY[i], ballW, ballH };
+				rectangle_type clipped{};
+				if (!maths::rectangle_clip(ghost, *dirty, &clipped))
+					continue;
+
+				const auto alpha = static_cast<unsigned>((i + 1) * TrailMaxAlpha / ball->TrailCount);
+				// Rainbow balls advance the hue along the tail for a flowing streak.
+				const float hueT = GlowPhase + static_cast<float>(i) * 0.04f;
+				paint_ghost(
+					clipped.Width,
+					clipped.Height,
+					clipped.XPosition,
+					clipped.YPosition,
+					clipped.XPosition - ghost.XPosition,
+					clipped.YPosition - ghost.YPosition,
+					vscreen,
+					zscreen,
+					clipped.XPosition,
+					clipped.YPosition,
+					ball->Bmp,
+					ball->Depth,
+					alpha,
+					effectBall ? &ballStyle : nullptr,
+					hueT);
+			}
+
+			// The dirty rect now covers the trail as well, so it can be larger than
+			// the ball bitmap. paint_flat reads the source without bounds checks,
+			// therefore only the intersection with the ball itself may be passed -
+			// otherwise it walks off the end of the bitmap and writes garbage.
+			rectangle_type ballClipped{};
+			if (maths::rectangle_clip(ball->BmpRect, *dirty, &ballClipped))
+			{
+				if (effectBall)
+				{
+					// Tinted sphere for the effect balls; the classic ball keeps
+					// the original bitmap verbatim.
+					paint_ball(
+						ballClipped.Width,
+						ballClipped.Height,
+						ballClipped.XPosition,
+						ballClipped.YPosition,
+						ballClipped.XPosition - ballX,
+						ballClipped.YPosition - ballY,
+						vscreen,
+						zscreen,
+						ballClipped.XPosition,
+						ballClipped.YPosition,
+						ball->Bmp,
+						ball->Depth,
+						&ballStyle,
+						GlowPhase);
+				}
+				else
+				{
+					zdrv::paint_flat(
+						ballClipped.Width,
+						ballClipped.Height,
+						vscreen,
+						ballClipped.XPosition,
+						ballClipped.YPosition,
+						zscreen,
+						ballClipped.XPosition,
+						ballClipped.YPosition,
+						ball->Bmp,
+						ballClipped.XPosition - ballX,
+						ballClipped.YPosition - ballY,
+						ball->Depth);
+				}
+			}
+
+			// Elemental halo + glowing core around the ball. Drawn after the
+			// solid ball so it reads as an aura rather than a flat disc.
+			if (effectBall && ballStyle.Glow > 0.0f)
+			{
+				uint8_t gr = ballStyle.R, gg = ballStyle.G, gb = ballStyle.B;
+				if (ballStyle.Rainbow)
+					balleffects::RainbowColor(GlowPhase, gr, gg, gb);
+				paint_glow(ballX + ballW / 2, ballY + ballH / 2, ballRadius, glowR,
+				           gr, gg, gb, ballStyle.Glow, vscreen, zscreen, ball->Depth, *dirty);
+			}
 		}
 		else
 		{
 			dirty->Width = -1;
 		}
+
+		// Remember the current position so the next frame can fade it out.
+		if (trailEnabled)
+		{
+			// Interpolate between frames: a fast ball would otherwise leave a few
+			// far-apart ghosts instead of a continuous streak. One ghost per
+			// TrailGhostSpacing pixels of travel keeps the spacing - and therefore
+			// the length of the tail - the same no matter how fast the ball moves.
+			const auto lastX = ball->TrailCount > 0 ? ball->TrailX[ball->TrailCount - 1] : ballX;
+			const auto lastY = ball->TrailCount > 0 ? ball->TrailY[ball->TrailCount - 1] : ballY;
+			const auto stepX = ballX - lastX;
+			const auto stepY = ballY - lastY;
+			const auto stepDist = std::sqrt(static_cast<double>(stepX * stepX + stepY * stepY));
+
+			if (stepX == 0 && stepY == 0)
+			{
+				// Ball at rest - the existing ghosts already sit on top of it, so
+				// there is nothing to add and no point re-blitting them.
+				continue;
+			}
+
+			auto steps = static_cast<int>(stepDist / TrailGhostSpacing) + 1;
+			if (steps > TrailMaxSteps)
+				steps = TrailMaxSteps;
+
+			for (auto s = 1; s <= steps; s++)
+			{
+				if (ball->TrailCount == render_sprite::TrailCapacity)
+				{
+					for (int i = 1; i < ball->TrailCount; i++)
+					{
+						ball->TrailX[i - 1] = ball->TrailX[i];
+						ball->TrailY[i - 1] = ball->TrailY[i];
+					}
+					ball->TrailCount--;
+				}
+
+				ball->TrailX[ball->TrailCount] = lastX + stepX * s / steps;
+				ball->TrailY[ball->TrailCount] = lastY + stepY * s / steps;
+				ball->TrailCount++;
+			}
+		}
+		else
+		{
+			ball->TrailCount = 0;
+		}
 	}
+}
+
+bool render::SaveScreenshot(const char* path)
+{
+	int width, height;
+	if (SDL_GetRendererOutputSize(winmain::Renderer, &width, &height) != 0 || width <= 0 || height <= 0)
+		return false;
+
+	auto* surface = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
+	if (!surface)
+		return false;
+
+	auto saved = false;
+	if (SDL_RenderReadPixels(winmain::Renderer, nullptr, SDL_PIXELFORMAT_ARGB8888,
+	                         surface->pixels, surface->pitch) == 0)
+	{
+		saved = SDL_SaveBMP(surface, path) == 0;
+	}
+
+	SDL_FreeSurface(surface);
+	return saved;
 }
 
 void render::unpaint_balls()
@@ -315,8 +746,7 @@ void render::unpaint_balls()
 	}
 }
 
-void render::shift(int offsetX, int offsetY)
-{
+void render::shift(int offsetX, int offsetY){
 	offset_x += offsetX;
 	offset_y += offsetY;
 }
@@ -332,14 +762,14 @@ void render::build_occlude_list()
 			mainSprite->OccludedSprites = nullptr;
 		}
 
-		if (!mainSprite->DeleteFlag && mainSprite->BoundingRect.Width != -1)
+		if (!mainSprite->DeleteFlag && !mainSprite->Hidden && mainSprite->BoundingRect.Width != -1)
 		{
 			if (!spriteArr)
 				spriteArr = new std::vector<render_sprite*>();
 
 			for (auto refSprite : sprite_list)
 			{
-				if (!refSprite->DeleteFlag
+				if (!refSprite->DeleteFlag && !refSprite->Hidden
 					&& refSprite->BoundingRect.Width != -1
 					&& maths::rectangle_clip(mainSprite->BoundingRect, refSprite->BoundingRect, nullptr))
 				{
@@ -358,6 +788,56 @@ void render::build_occlude_list()
 	}
 
 	delete spriteArr;
+}
+
+void render::InvalidateAll(bool resetDepth)
+{
+	if (!vscreen || !zscreen)
+		return;
+
+	if (resetDepth)
+	{
+		// Nothing on screen is valid any more: every sprite has to be able to
+		// overwrite the depth values the old arrangement left behind.
+		zdrv::fill(zscreen, zscreen->Width, zscreen->Height, 0, 0, 0xFFFF);
+	}
+
+	for (auto sprite : sprite_list)
+	{
+		// An empty previous rectangle makes the sprite report its whole area as
+		// damaged, so the background and everything on it are repainted.
+		sprite->DirtyRectPrev = rectangle_type{};
+
+		if (sprite->VisualType == VisualTypes::Ball)
+			continue;
+
+		if (sprite->Hidden)
+		{
+			sprite->DirtyFlag = false;
+			continue;
+		}
+
+		sprite->DirtyFlag = true;
+		// Left alone, update() would keep the damage rectangle it computed for
+		// the previous frame, which after a move is somewhere else entirely.
+		if (resetDepth)
+			sprite->DirtyRect = sprite->BmpRect;
+	}
+
+	if (resetDepth)
+	{
+		// The ball save buffers hold pixels copied out of the old frame, so
+		// restoring them on the next unpaint would smear it back in.
+		for (auto ball : ball_list)
+		{
+			ball->DirtyRect.Width = -1;
+			ball->DirtyRectPrev = rectangle_type{};
+			ball->TrailCount = 0;
+		}
+	}
+
+	// The depth buffer is otherwise deliberately left alone: only colours
+	// changed, so the existing depth values are still valid.
 }
 
 void render::SpriteViewer(bool* show)
@@ -456,68 +936,26 @@ void render::PresentVScreen()
 {
 	vscreen->BlitToTexture();
 
-	if (offset_x == 0 && offset_y == 0)
+	// The scoreboard column the .DAT reserves on the right is never shown: the
+	// score lives in the toolbar drawn over the top of the table instead.
+	// Clipping the source here is what hands that wasted part of the canvas
+	// back to the playfield, and it works for every skin without touching the
+	// artwork or the depth map.
+	const auto tableWidth = fullscrn::GetTableWidth();
+	SDL_Rect srcRect{ 0, 0, tableWidth, vscreen->Height };
+	if (tableWidth <= 0 || tableWidth >= vscreen->Width)
+		srcRect.w = vscreen->Width;
+
+	// Nudging still has to shake the board, so the offset goes on the
+	// destination rect instead; there is no sidebar left that must stay put.
+	SDL_Rect dstRect = DestinationRect;
+	if (offset_x != 0 || offset_y != 0)
 	{
-		SDL_RenderCopy(winmain::Renderer, vscreen->Texture, nullptr, &DestinationRect);
+		dstRect.x += static_cast<int>(lround(offset_x * fullscrn::ScaleX));
+		dstRect.y += static_cast<int>(lround(offset_y * fullscrn::ScaleY));
 	}
-	else
-	{
-		auto tableWidthCoef = static_cast<float>(pb::MainTable->Width) / vscreen->Width;
-		auto srcSeparationX = static_cast<int>(round(vscreen->Width * tableWidthCoef));
-		auto srcBoardRect = SDL_Rect
-		{
-			0, 0,
-			srcSeparationX, vscreen->Height
-		};
-		auto srcSidebarRect = SDL_Rect
-		{
-			srcSeparationX, 0,
-			vscreen->Width - srcSeparationX, vscreen->Height
-		};
 
-#if SDL_VERSION_ATLEAST(2, 0, 10)
-		// SDL_RenderCopyF was added in 2.0.10
-		auto dstSeparationX = DestinationRect.w * tableWidthCoef;
-		auto dstBoardRect = SDL_FRect
-		{
-			DestinationRect.x + offset_x * fullscrn::ScaleX,
-			DestinationRect.y + offset_y * fullscrn::ScaleY,
-			dstSeparationX, static_cast<float>(DestinationRect.h)
-		};
-		auto dstSidebarRect = SDL_FRect
-		{
-			DestinationRect.x + dstSeparationX, static_cast<float>(DestinationRect.y),
-			DestinationRect.w - dstSeparationX, static_cast<float>(DestinationRect.h)
-		};
-
-		SDL_RenderCopyF(winmain::Renderer, vscreen->Texture, &srcBoardRect, &dstBoardRect);
-		SDL_RenderCopyF(winmain::Renderer, vscreen->Texture, &srcSidebarRect, &dstSidebarRect);
-#else
-		// SDL_RenderCopy cannot express sub pixel offset.
-		// Vscreen shift is required for that.
-		auto dstSeparationX = static_cast<int>(DestinationRect.w * tableWidthCoef);
-		auto scaledOffX = static_cast<int>(round(offset_x * fullscrn::ScaleX));
-		if (offset_x != 0 && scaledOffX == 0)
-			scaledOffX = Sign(offset_x);
-		auto scaledOffY = static_cast<int>(round(offset_y * fullscrn::ScaleY));
-		if (offset_y != 0 && scaledOffX == 0)
-			scaledOffY = Sign(offset_y);
-
-		auto dstBoardRect = SDL_Rect
-		{
-			DestinationRect.x + scaledOffX, DestinationRect.y + scaledOffY,
-			dstSeparationX, DestinationRect.h
-		};
-		auto dstSidebarRect = SDL_Rect
-		{
-			DestinationRect.x + dstSeparationX, DestinationRect.y,
-			DestinationRect.w - dstSeparationX, DestinationRect.h
-		};
-
-		SDL_RenderCopy(winmain::Renderer, vscreen->Texture, &srcBoardRect, &dstBoardRect);
-		SDL_RenderCopy(winmain::Renderer, vscreen->Texture, &srcSidebarRect, &dstSidebarRect);
-#endif
-	}
+	SDL_RenderCopy(winmain::Renderer, vscreen->Texture, &srcRect, &dstRect);
 
 	if (options::Options.DebugOverlay)
 	{

@@ -109,6 +109,11 @@ void TLine::place_in_grid(RectF* aabb)
 
 		for (auto indexX = xBox0, indexY = yBox0; indexX != xBox1 || indexY != yBox1;)
 		{
+			// The walk is driven by box indices, so an endpoint that had to be
+			// clamped instead of landing in its own box can make the two indices
+			// miss each other for good. Stop rather than run off BoxArray.
+			if (indexX < 0 || indexX >= edgeMan->MaxBoxX || indexY < 0 || indexY >= edgeMan->MaxBoxY)
+				return;
 			// Calculate y from indexY and from line formula
 			auto yDiscrete = (indexY + yBias) * edgeMan->AdvanceY + edgeMan->MinY;
 			auto ylinear = ((indexX + xBias) * edgeMan->AdvanceX + edgeMan->MinX) * dyDx + precomp;

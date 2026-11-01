@@ -289,4 +289,8 @@ struct optionsStruct
 	StringOption FontFileName;
 	StringOption Language;
 	BoolOption HideCursor;
+	BoolOption BallTrail;
+	IntOption BallKind;
+	StringOption TableTheme;
+	StringOption TableLayout;
 };

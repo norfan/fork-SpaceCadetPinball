@@ -7,10 +7,15 @@
 #include "midi.h"
 #include "options.h"
 #include "pb.h"
+#include "TPinballTable.h"
 #include "render.h"
 #include "Sound.h"
+#include "tablelayout.h"
+#include "tabletheme.h"
 #include "translations.h"
 #include "font_selection.h"
+#include "hud.h"
+#include "balleffects.h"
 
 constexpr const char* winmain::Version;
 
@@ -42,7 +47,12 @@ bool winmain::ShowExitPopup = false;
 bool winmain::LaunchBallEnabled = true;
 bool winmain::HighScoresEnabled = true;
 bool winmain::DemoActive = false;
+bool winmain::Autoplay = false;
 int winmain::MainMenuHeight = 0;
+std::string winmain::ScreenshotPath;
+int winmain::ScreenshotFrame = 600;
+int winmain::ScreenshotCount = 1;
+int winmain::ScreenshotInterval = 8;
 std::string winmain::FpsDetails, winmain::PrevSdlError;
 unsigned winmain::PrevSdlErrorCount = 0;
 double winmain::UpdateToFrameRatio;
@@ -170,15 +180,24 @@ int winmain::WinMain(LPCSTR lpCmdLine)
 			options::ResetAllOptions();
 		}
 
+		// Load a UI font. The glyph-range vector (ranges) is referenced by
+		// pointer from the font config and is only consumed when Build() runs, so
+		// Build() must be called while ranges is still in scope.
 		if (!Options.FontFileName.V.empty())
 		{
 			ImVector<ImWchar> ranges;
 			translations::GetGlyphRange(&ranges);
 			ImFontConfig fontConfig{};
 
-			// ToDo: further tweak font options, maybe try imgui_freetype
-			fontConfig.OversampleV = 2;
-			fontConfig.OversampleH = 4;
+			// Bake the UI scale into the font size. Stretching an already rasterized
+			// atlas through FontGlobalScale is what used to make menu text blurry.
+			const auto uiScale = std::max(1.0f, Options.UIScale.V);
+			const auto fontSize = 13.f * uiScale;
+
+			// Oversampling only pays off for small glyphs; drop it on large sizes.
+			const auto bigFont = fontSize >= 26.f;
+			fontConfig.OversampleV = bigFont ? 1 : 2;
+			fontConfig.OversampleH = bigFont ? 2 : 4;
 
 			// ToDo: improve font file test, checking if file exists is not enough
 			auto fontLoaded = false;
@@ -188,17 +207,44 @@ int winmain::WinMain(LPCSTR lpCmdLine)
 			{
 				fclose(fileHandle);
 
-				// ToDo: Bind font size to UI scale
-				if (io.Fonts->AddFontFromFileTTF(fileName, 13.f, &fontConfig, ranges.Data))
+				if (io.Fonts->AddFontFromFileTTF(fileName, fontSize, &fontConfig, ranges.Data))
 					fontLoaded = true;
 			}
 
 			if (!fontLoaded)
 				printf("Failed to load font: %s, using embedded font.\n", fileName);
+
+			// Build now, while 'ranges' is still alive. If no font ended up being
+			// added, Build() falls back to the embedded default font automatically.
 			io.Fonts->Build();
 		}
+
+		// ImGui dereferences io.Fonts->Fonts[0] during frame setup, so the atlas
+		// must never be empty. Guarantee a usable default before anything else.
+		// AddFontDefault uses the embedded ProggyClean font and its own glyph
+		// ranges, so it is safe here (ranges is out of scope for the custom path).
+		if (io.Fonts->Fonts.Size == 0)
+		{
+			io.Fonts->AddFontDefault();
+			io.Fonts->Build();
+		}
+
+		// The toolbar uses an oversized font that is baked larger than it is
+		// drawn, so the numerals stay crisp when scaled down.
+		hud::InitFont();
+
+		// hud::InitFont() appended a font to the atlas after the first Build(),
+		// so rebuild now to rasterise its glyphs before the renderer backend
+		// uploads the font texture.
+		io.Fonts->Build();
+
 		ImGui_Render_Init(renderer);
 		ImGui::StyleColorsDark();
+
+		// Widget metrics must follow the enlarged font, otherwise text overflows
+		// the menus and dialogs it was laid out for at 13px.
+		if (Options.UIScale.V > 1.0f)
+			ImGui::GetStyle().ScaleAllSizes(Options.UIScale.V);
 
 		ImGui_ImplSDL2_InitForSDLRenderer(window, Renderer);
 		io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
@@ -217,6 +263,32 @@ int winmain::WinMain(LPCSTR lpCmdLine)
 
 		// Second step: run updates that depend on .DAT file selection
 		options::InitSecondary();
+
+		// -theme=<name> preselects a playfield skin; pb::init applies it below.
+		if (const auto* arg = strstr(lpCmdLine, "-theme="))
+		{
+			const auto* name = arg + 7;
+			const auto* end = name;
+			while (*end && *end != ' ')
+				++end;
+			if (end > name)
+				Options.TableTheme.V = std::string(name, end);
+		}
+
+		// -ball=<0..7> preselects an effect ball (0 = classic).
+		if (const auto* arg = strstr(lpCmdLine, "-ball="))
+		{
+			const auto* name = arg + 6;
+			char* end = nullptr;
+			const auto value = strtol(name, &end, 10);
+			if (end != name && value >= 0 && value < balleffects::Count())
+				Options.BallKind.V = static_cast<int>(value);
+		}
+
+		// -debug shows the collision overlay, which is the quickest way to check
+		// that a playfield layout puts its walls where they are drawn.
+		if (strstr(lpCmdLine, "-debug"))
+			Options.DebugOverlay.V = true;
 
 		Sound::Init(mixOpened, Options.SoundChannels, Options.Sounds, Options.SoundVolume);
 		if (!mixOpened)
@@ -253,7 +325,25 @@ int winmain::WinMain(LPCSTR lpCmdLine)
 		if (!Options.FullScreen)
 		{
 			auto resInfo = &fullscrn::resolution_array[fullscrn::GetResolution()];
-			SDL_SetWindowSize(MainWindow, resInfo->TableWidth, resInfo->TableHeight);
+			// The playfield is a tall column now that the scoreboard column is
+			// gone, so size the window around it and let it use most of the
+			// screen height.
+			auto windowWidth = static_cast<int>(lround(resInfo->TableWidth * fullscrn::TableWidthRatio));
+			auto windowHeight = static_cast<int>(resInfo->TableHeight);
+			auto displayHeight = 0;
+			SDL_DisplayMode mode{};
+			if (SDL_GetCurrentDisplayMode(0, &mode) == 0)
+				displayHeight = mode.h;
+			if (displayHeight > 0)
+			{
+				const auto fit = static_cast<float>(displayHeight) * 0.86f / windowHeight;
+				if (fit > 1.0f)
+				{
+					windowWidth = static_cast<int>(lround(windowWidth * fit));
+					windowHeight = static_cast<int>(lround(windowHeight * fit));
+				}
+			}
+			SDL_SetWindowSize(MainWindow, windowWidth, windowHeight);
 		}
 		SDL_ShowWindow(window);
 		fullscrn::set_screen_mode(Options.FullScreen);
@@ -262,6 +352,24 @@ int winmain::WinMain(LPCSTR lpCmdLine)
 			pb::toggle_demo();
 		else
 			pb::replay_level(false);
+
+		if (strstr(lpCmdLine, "-autoplay"))
+			Autoplay = true;
+
+		if (const auto* arg = strstr(lpCmdLine, "-screenshot="))
+		{
+			const auto* path = arg + 12;
+			const auto* end = path;
+			while (*end && *end != ' ')
+				++end;
+			ScreenshotPath.assign(path, end);
+		}
+		if (const auto* arg = strstr(lpCmdLine, "-screenshot-frame="))
+			ScreenshotFrame = atoi(arg + 18);
+		if (const auto* arg = strstr(lpCmdLine, "-screenshot-count="))
+			ScreenshotCount = std::max(1, atoi(arg + 18));
+		if (const auto* arg = strstr(lpCmdLine, "-screenshot-interval="))
+			ScreenshotInterval = std::max(1, atoi(arg + 21));
 
 		MainLoop();
 
@@ -374,10 +482,19 @@ void winmain::MainLoop()
 			{
 				if (Options.HideCursor && CursorIdleCounter <= 0)
 					ImGui::SetMouseCursor(ImGuiMouseCursor_None);
-				ImGui_ImplSDL2_NewFrame();
-				ImGui_Render_NewFrame();
-				ImGui::NewFrame();
-				RenderUi();
+		ImGui_ImplSDL2_NewFrame();
+		ImGui_Render_NewFrame();
+		// Safety net: if the font atlas was somehow torn down (e.g. a theme/font
+		// reload) leaving Fonts[0] with a null ContainerAtlas, rebuild it before
+		// NewFrame dereferences it and crashes. The atlas is not locked yet here.
+		{
+			auto& guardIo = ImGui::GetIO();
+			if (guardIo.Fonts->Fonts.Size == 0 || guardIo.Fonts->Fonts[0]->ContainerAtlas == nullptr)
+				guardIo.Fonts->Build();
+		}
+		ImGui::NewFrame();
+		RenderUi();
+		hud::Draw();
 
 				SDL_RenderClear(Renderer);
 				// Alternative clear hack, clear might fail on some systems
@@ -385,8 +502,13 @@ void winmain::MainLoop()
 				SDL_RenderFillRect(Renderer, nullptr);
 				render::PresentVScreen();
 
-				ImGui::Render();
-				ImGui_Render_RenderDrawData(ImGui::GetDrawData());
+		ImGui::Render();
+		ImGui_Render_RenderDrawData(ImGui::GetDrawData());
+
+				if (!ScreenshotPath.empty() && frameCounter >= ScreenshotFrame)
+				{
+					TakeScheduledScreenshots(frameCounter);
+				}
 
 				SDL_RenderPresent(Renderer);
 				frameCounter++;
@@ -605,10 +727,66 @@ void winmain::RenderUi()
 				{
 					options::toggle(Menu1::WindowIntegerScale);
 				}
-				if (ImGui::DragFloat("UI Scale", &Options.UIScale.V, 0.005f, 0.8f, 5,
-				                     "%.2f", ImGuiSliderFlags_AlwaysClamp))
+				// The font atlas is rasterized once at startup, so this needs a restart.
+				ImGui::DragFloat("UI Scale (restart)", &Options.UIScale.V, 0.005f, 0.8f, 5,
+				                 "%.2f", ImGuiSliderFlags_AlwaysClamp);
+				if (ImGui::MenuItem("Ball Motion Trail", nullptr, Options.BallTrail))
 				{
-					ImIO->FontGlobalScale = Options.UIScale;
+					Options.BallTrail ^= true;
+				}
+				if (ImGui::BeginMenu("Effect Ball"))
+				{
+					for (int k = 0; k < balleffects::Count(); ++k)
+					{
+						auto kind = static_cast<balleffects::Kind>(k);
+						if (ImGui::MenuItem(balleffects::Name(kind), nullptr, Options.BallKind == k))
+						{
+							Options.BallKind = k;
+						}
+					}
+					ImGui::EndMenu();
+				}
+				if (ImGui::BeginMenu("Table Theme"))
+				{
+					if (ImGui::MenuItem("Original (stock)", nullptr, tabletheme::Current() == 0))
+					{
+						tabletheme::Set(0);
+					}
+					ImGui::Separator();
+					const auto& skins = tabletheme::Entries();
+					for (int i = 0; i < tabletheme::Count(); ++i)
+					{
+						if (ImGui::MenuItem(skins[i].Name.c_str(), nullptr, tabletheme::Current() == i + 1))
+						{
+							tabletheme::Set(i + 1);
+						}
+					}
+					if (tabletheme::Count() == 0)
+					{
+						ImGui::TextDisabled("Nothing in themes/");
+					}
+					ImGui::Separator();
+					if (ImGui::MenuItem("Rescan themes/", "F7 cycles"))
+					{
+						tabletheme::ApplySaved();
+					}
+					ImGui::EndMenu();
+				}
+				if (ImGui::BeginMenu("Table Layout"))
+				{
+					if (ImGui::MenuItem("Stock", "F8 cycles", tablelayout::Current() == 0))
+					{
+						tablelayout::Set(0);
+					}
+					ImGui::Separator();
+					for (int i = 1; i <= tablelayout::Count(); ++i)
+					{
+						if (ImGui::MenuItem(tablelayout::Name(i), nullptr, tablelayout::Current() == i))
+						{
+							tablelayout::Set(i);
+						}
+					}
+					ImGui::EndMenu();
 				}
 				ImGui::Separator();
 
@@ -904,6 +1082,20 @@ int winmain::event_handler(const SDL_Event* event)
 			break;
 
 		pb::InputDown({InputTypes::Keyboard, event->key.keysym.sym});
+
+		// Playfield skins are swapped at runtime, so this works before the cheat
+		// mode check below.
+		if (event->key.keysym.sym == SDLK_F7)
+		{
+			tabletheme::Next();
+			break;
+		}
+		if (event->key.keysym.sym == SDLK_F8)
+		{
+			tablelayout::Next();
+			break;
+		}
+
 		if (!pb::cheat_mode)
 			break;
 
@@ -1342,8 +1534,32 @@ void winmain::HandleGameBinding(GameBindings binding, bool shortcut)
 	}
 }
 
-void winmain::RenderFrameTimeDialog()
+void winmain::TakeScheduledScreenshots(int frame)
 {
+	static int taken = 0;
+	if (ScreenshotPath.empty() || taken >= ScreenshotCount)
+		return;
+	if (frame < ScreenshotFrame + taken * ScreenshotInterval)
+		return;
+
+	auto base = ScreenshotPath;
+	const auto dot = base.rfind('.');
+	if (dot != std::string::npos)
+		base.erase(dot);
+
+	char path[512];
+	if (ScreenshotCount > 1)
+		snprintf(path, sizeof path, "%s_%02d.bmp", base.c_str(), taken);
+	else
+		snprintf(path, sizeof path, "%s.bmp", base.c_str());
+
+	if (render::SaveScreenshot(path))
+		taken++;
+	else
+		ScreenshotPath.clear();
+}
+
+void winmain::RenderFrameTimeDialog(){
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, ImVec2{300, 70});
 	if (ImGui::Begin("Frame Times", &DispGRhistory, ImGuiWindowFlags_NoScrollbar))
 	{

@@ -25,6 +25,7 @@ TTableLayer::TTableLayer(TPinballTable* table): TCollisionComponent(table, -1, f
 	/*Full tilt: proj center first value is offset by resolution*/
 	auto projCenter = loader::query_float_attribute(groupIndex, 0, 700 + fullscrn::GetResolution());
 	proj::recenter(projCenter[0], projCenter[1]);
+
 	render::set_background_zmap(spriteData.ZMap, 0, 0);
 
 	auto bmp = spriteData.Bmp;

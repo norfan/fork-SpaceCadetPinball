@@ -30,6 +30,14 @@ public:
 	static void window_size_changed();
 	static SDL_Rect GetScreenRectFromPinballRect(SDL_Rect rect);
 	static float GetScreenToPinballRatio();
+
+	// Width of the playfield part of the canvas, as a fraction of TableWidth.
+	// The remaining 40% on the right is the original scoreboard sidebar, which
+	// the table-only view hides.
+	static constexpr float TableWidthRatio = 0.6f;
+
+	// Playfield width in vScreen pixels for the current resolution.
+	static int GetTableWidth();
 private :
 	static int resolution;
 

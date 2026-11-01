@@ -152,6 +152,10 @@ optionsStruct options::Options
 	{"FontFileName", ""},
 	{"Language", translations::GetCurrentLanguage()->ShortName},
 	{"Hide Cursor", false},
+	{"Ball Trail", true},
+	{"BallKind", 0},
+	{"Table Theme", ""},
+	{"Table Layout", ""},
 };
 
 void options::InitPrimary()
@@ -494,7 +498,9 @@ void options::MyUserData_WriteAll(ImGuiContext* ctx, ImGuiSettingsHandler* handl
 
 void options::PostProcessOptions()
 {
-	winmain::ImIO->FontGlobalScale = Options.UIScale;
+	// The font atlas is already rasterized at the scaled size (see winmain.cpp),
+	// so stretching it here again would only reintroduce blur.
+	winmain::ImIO->FontGlobalScale = 1.0f;
 	Options.FramesPerSecond = Clamp(Options.FramesPerSecond.V, MinFps, MaxFps);
 	Options.UpdatesPerSecond = Clamp(Options.UpdatesPerSecond.V, MinUps, MaxUps);
 	Options.UpdatesPerSecond = std::max(Options.UpdatesPerSecond.V, Options.FramesPerSecond.V);

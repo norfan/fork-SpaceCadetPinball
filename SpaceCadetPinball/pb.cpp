@@ -23,6 +23,8 @@
 #include "GroupData.h"
 #include "partman.h"
 #include "score.h"
+#include "tablelayout.h"
+#include "tabletheme.h"
 #include "TFlipper.h"
 #include "TPinballTable.h"
 #include "TTextBox.h"
@@ -102,6 +104,13 @@ int pb::init()
 	score::init();
 
 	MainTable = new TPinballTable();
+
+	// The components, their sprites and the collision grid now exist, so the
+	// playfield picked last session can be rebuilt. Geometry comes first: the
+	// layout snapshots the table in its authored state, and the skin is then
+	// free to hand over to a layout of its own.
+	tablelayout::ApplySaved();
+	tabletheme::ApplySaved();
 
 	high_score::read();
 	auto ball = MainTable->BallList.at(0);
@@ -300,6 +309,64 @@ void pb::frame(float dtMilliSec)
 
 	float dtSec = dtMilliSec * 0.001f;
 	time_next = time_now + dtSec;
+
+	// Debug/demo helper: -autoplay starts a game on its own, then keeps the
+	// plunger cycling, so the table can be observed without any keyboard input
+	// (handy for screen recording too).
+	if (winmain::Autoplay && MainTable)
+	{
+		static float restartTimer = 0.0f;
+		static float plungerTimer = 0.0f;
+		static float flipTimer = 0.0f;
+		static bool plungerHeld = false;
+		static bool flippersHeld = false;
+
+		if (game_mode != GameModes::InGame)
+		{
+			// Idle or game over: ask for a new game now and then.
+			restartTimer += dtSec;
+			if (restartTimer > 2.0f)
+			{
+				restartTimer = 0.0f;
+				plungerHeld = false;
+				plungerTimer = 0.0f;
+				replay_level(false);
+			}
+		}
+		else
+		{
+			restartTimer = 0.0f;
+			plungerTimer += dtSec;
+			flipTimer += dtSec;
+
+			if (!plungerHeld && plungerTimer > 1.5f)
+			{
+				MainTable->Message(MessageCode::PlungerInputPressed, 0);
+				plungerHeld = true;
+				plungerTimer = 0.0f;
+			}
+			else if (plungerHeld && plungerTimer > 0.8f)
+			{
+				MainTable->Message(MessageCode::PlungerInputReleased, time_next);
+				plungerHeld = false;
+				plungerTimer = 0.0f;
+			}
+
+			// Keep flipping so the ball stays in play instead of draining immediately.
+			if ((!flippersHeld && flipTimer > 0.55f) || (flippersHeld && flipTimer > 0.18f))
+			{
+				flippersHeld = !flippersHeld;
+				flipTimer = 0.0f;
+				MainTable->Message(
+					flippersHeld ? MessageCode::LeftFlipperInputPressed : MessageCode::LeftFlipperInputReleased,
+					time_now);
+				MainTable->Message(
+					flippersHeld ? MessageCode::RightFlipperInputPressed : MessageCode::RightFlipperInputReleased,
+					time_now);
+			}
+		}
+	}
+
 	timed_frame(dtSec);
 	time_now = time_next;
 
